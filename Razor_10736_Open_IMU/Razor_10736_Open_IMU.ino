@@ -4,8 +4,8 @@
 #define ToDeg(x) ((x) * 57.2957795131)  // *180/pi
 #define PI_FLOAT     3.14159265f
 #define PIBY2_FLOAT  1.5707963f
-#define betaDef		0.1f
-#define betaDef2 1.6f
+#define betaDef		0.15f
+
 
 #define ADXL435_ADDR 0x53
 #define ITG3200_ADDR 0x68
@@ -24,10 +24,20 @@
 #define GYRO_TO_RAD 0.001214142f //(14.375^-1 * pi/180)
 #define GYRO_TO_DEG 0.069565217f
 //mag defines
-#define CONFIG_REG_A 0x00
+#define CONFIG_REG_A (uint8_t)0x00
 #define CONFIG_REG_B 0x01
 #define MODE_REG 0x02
 #define MAG_X_MSB 0x03
+
+#define compassXMax 327.0f
+#define compassXMin -284.0f
+#define compassYMax 280.0f
+#define compassYMin -334.0f
+#define compassZMax 343.0f
+#define compassZMin -267.0f
+#define inverseXRange (float)(2.0 / (compassXMax - compassXMin))
+#define inverseYRange (float)(2.0 / (compassYMax - compassYMin))
+#define inverseZRange (float)(2.0 / (compassZMax - compassZMin))
 
 int16_t accX,accY,accZ;
 int16_t gyroX,gyroY,gyroZ;
@@ -37,13 +47,16 @@ int16_t offsetX,offsetY,offsetZ;
 int32_t gyroSumX,gyroSumY,gyroSumZ;
 
 float smoothX,smoothY,smoothZ;
+float accToFilterX,accToFilterY,accToFilterZ;
+float floatMagX,floatMagY,floatMagZ;//needs to be a float so the vector can be normalized
+
 byte lsb,msb;
 
 //Wire does not like 0x00
 uint8_t HEX_ZERO = 0x00;
 
 long timer, printTimer;
-float G_Dt;
+float dt;
 uint32_t loopCount = 0;
 
 float q0;
@@ -51,7 +64,7 @@ float q1;
 float q2;
 float q3;
 float beta = betaDef;
-float beta2 = betaDef2;
+
 float magnitude;
 
 float pitch,roll,yaw;
@@ -62,30 +75,21 @@ void setup(){
   Wire.begin(); 
   TWBR = ((F_CPU / 400000) - 16) / 2;
   Init();
-  timer = millis();
+  timer = micros();
 }
 
 void loop(){
-  if (millis() - timer >= 3){
-    G_Dt = (millis() - timer)/1000.0;
-    timer=millis();
+  if (micros() - timer >= 5000){
+    dt = (micros() - timer)/1000000.0;
+    timer=micros();
+    GetMag();
+    GetGyro();
+    GetAcc();
+    AHRSupdate();
+    loopCount = 0;
 
-    if (loopCount == 3){
-      GetMag();
-      GetGyro();
-      GetAcc();
-      AHRSupdate(&G_Dt);
-      loopCount = 0;
-
-    }
-    else{
-      GetGyro();
-      GetAcc();
-      IMUupdate(&G_Dt);
-      loopCount++;
-    } 
   }
-  
+
   if (millis() - printTimer > 50){
     printTimer = millis();
     GetEuler();
@@ -102,13 +106,22 @@ void loop(){
 
 
 void Init(){
+
+
+  Wire.beginTransmission(HMC5883_ADDR);
+  Wire.write(CONFIG_REG_A);
+  Wire.write(0x1C);//220Hz update rate
+  Wire.endTransmission();
+
+  Wire.beginTransmission(HMC5883_ADDR);
+  Wire.write(CONFIG_REG_B);
+  Wire.write(0x60);//+/- 2.5 gauss
+  Wire.endTransmission();
+
   Wire.beginTransmission(HMC5883_ADDR);
   Wire.write(MODE_REG);
-  Wire.write(HEX_ZERO);
-  Wire.endTransmission();
-  Wire.beginTransmission(HMC5883_ADDR);
-  Wire.write(0x18);
-  Wire.endTransmission();
+  Wire.write((uint8_t)0x00);//continuous conversion mode
+  Wire.endTransmission();  
 
   Wire.beginTransmission(ADXL435_ADDR);
   Wire.write(BW_RATE);
@@ -190,8 +203,8 @@ void Init(){
 
 
   //tilt compensate the compass
-  float xMag = (magX * cos(ToRad(pitch))) + (magZ * sin(ToRad(pitch)));
-  float yMag = -1 * ((magX * sin(ToRad(roll))  * sin(ToRad(pitch))) + (magY * cos(ToRad(roll))) - (magZ * sin(ToRad(roll)) * cos(ToRad(pitch))));
+  float xMag = (floatMagX * cos(ToRad(pitch))) + (floatMagZ * sin(ToRad(pitch)));
+  float yMag = -1 * ((floatMagX * sin(ToRad(roll))  * sin(ToRad(pitch))) + (floatMagY * cos(ToRad(roll))) - (floatMagZ * sin(ToRad(roll)) * cos(ToRad(pitch))));
   yaw = ToDeg(fastAtan2(yMag,xMag));
 
   if (yaw < 0){
@@ -253,6 +266,11 @@ void GetMag(){
   msb = Wire.read();//Y register
   lsb = Wire.read();
   magX = (((msb << 8) | lsb));    
+  
+  floatMagX = ((float)magX - compassXMin) * inverseXRange - 1.0;
+  floatMagY = ((float)magY - compassYMin) * inverseYRange - 1.0;
+  floatMagZ = ((float)magZ - compassZMin) * inverseZRange - 1.0;
+  
 }
 void GetAcc(){
   Wire.beginTransmission(ADXL435_ADDR);
@@ -272,6 +290,9 @@ void GetAcc(){
   Smoothing(&accX,&smoothX);
   Smoothing(&accY,&smoothY);
   Smoothing(&accZ,&smoothZ);
+  accToFilterX = smoothX;//if the value from the smoothing filter is sent it will not work when the algorithm normalizes the vector
+  accToFilterY = smoothY;
+  accToFilterZ = smoothZ;
 }
 
 void GetGyro(){
@@ -307,124 +328,8 @@ void GetEuler(void){
   }
 
 }
-void GYROupdate(float *dt){
-  static float qDot1, qDot2, qDot3, qDot4;
-  static float recipNorm;
-  static float gx;
-  static float gy;
-  static float gz;
 
-  gx = scaledGyroX;
-  gy = scaledGyroY;
-  gz = scaledGyroZ;
-
-  qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
-  qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
-  qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
-  qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
-  // Integrate rate of change of quaternion to yield quaternion
-  q0 += qDot1 * *dt;
-  q1 += qDot2 * *dt;
-  q2 += qDot3 * *dt;
-  q3 += qDot4 * *dt;
-
-  // Normalise quaternion
-  recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-  q0 *= recipNorm;
-  q1 *= recipNorm;
-  q2 *= recipNorm;
-  q3 *= recipNorm;
-}
-void IMUupdate(float *dt) {
-  static float gx;
-  static float gy;
-  static float gz;
-  static float ax;
-  static float ay;
-  static float az;
-
-  static float recipNorm;
-  static float s0, s1, s2, s3;
-  static float qDot1, qDot2, qDot3, qDot4;
-  static float _2q0, _2q1, _2q2, _2q3, _4q0, _4q1, _4q2 ,_8q1, _8q2, q0q0, q1q1, q2q2, q3q3;
-
-  gx = scaledGyroX;
-  gy = scaledGyroY;
-  gz = scaledGyroZ;
-
-  ax = accX;
-  ay = accY;
-  az = accZ;
-  // Rate of change of quaternion from gyroscope
-  qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
-  qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
-  qDot3 = 0.5f * (q0 * gy - q1 * gz + q3 * gx);
-  qDot4 = 0.5f * (q0 * gz + q1 * gy - q2 * gx);
-
-  magnitude = sqrt(ax * ax + ay * ay + az * az);
-  if ((magnitude > 384) || (magnitude < 128)){
-    ax = 0;
-    ay = 0;
-    az = 0;
-  }
-
-  // Compute feedback only if accelerometer measurement valid (avoids NaN in accelerometer normalisation)
-  if(!((ax == 0.0f) && (ay == 0.0f) && (az == 0.0f))) {
-
-    // Normalise accelerometer measurement
-    recipNorm = invSqrt(ax * ax + ay * ay + az * az);
-    ax *= recipNorm;
-    ay *= recipNorm;
-    az *= recipNorm;
-
-    // Auxiliary variables to avoid repeated arithmetic
-    _2q0 = 2.0f * q0;
-    _2q1 = 2.0f * q1;
-    _2q2 = 2.0f * q2;
-    _2q3 = 2.0f * q3;
-    _4q0 = 4.0f * q0;
-    _4q1 = 4.0f * q1;
-    _4q2 = 4.0f * q2;
-    _8q1 = 8.0f * q1;
-    _8q2 = 8.0f * q2;
-    q0q0 = q0 * q0;
-    q1q1 = q1 * q1;
-    q2q2 = q2 * q2;
-    q3q3 = q3 * q3;
-
-    // Gradient decent algorithm corrective step
-    s0 = _4q0 * q2q2 + _2q2 * ax + _4q0 * q1q1 - _2q1 * ay;
-    s1 = _4q1 * q3q3 - _2q3 * ax + 4.0f * q0q0 * q1 - _2q0 * ay - _4q1 + _8q1 * q1q1 + _8q1 * q2q2 + _4q1 * az;
-    s2 = 4.0f * q0q0 * q2 + _2q0 * ax + _4q2 * q3q3 - _2q3 * ay - _4q2 + _8q2 * q1q1 + _8q2 * q2q2 + _4q2 * az;
-    s3 = 4.0f * q1q1 * q3 - _2q1 * ax + 4.0f * q2q2 * q3 - _2q2 * ay;
-    recipNorm = invSqrt(s0 * s0 + s1 * s1 + s2 * s2 + s3 * s3); // normalise step magnitude
-    s0 *= recipNorm;
-    s1 *= recipNorm;
-    s2 *= recipNorm;
-    s3 *= recipNorm;
-
-    // Apply feedback step
-    qDot1 -= beta * s0;
-    qDot2 -= beta * s1;
-    qDot3 -= beta * s2;
-    qDot4 -= beta * s3;
-  }
-
-  // Integrate rate of change of quaternion to yield quaternion
-  q0 += qDot1 * *dt;
-  q1 += qDot2 * *dt;
-  q2 += qDot3 * *dt;
-  q3 += qDot4 * *dt;
-
-  // Normalise quaternion
-  recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
-  q0 *= recipNorm;
-  q1 *= recipNorm;
-  q2 *= recipNorm;
-  q3 *= recipNorm;
-}
-
-void AHRSupdate(float *dt) {
+void AHRSupdate() {
   static float gx;
   static float gy;
   static float gz;
@@ -446,13 +351,13 @@ void AHRSupdate(float *dt) {
   gy = scaledGyroY;
   gz = scaledGyroZ;
 
-  ax = accX;
-  ay = accY;
-  az = accZ;
+  ax = accToFilterX;
+  ay = accToFilterY;
+  az = accToFilterZ;
 
-  mx = magX;
-  my = magY;
-  mz = magZ;
+  mx = floatMagX;
+  my = floatMagY;
+  mz = floatMagZ;
   // Rate of change of quaternion from gyroscope
   qDot1 = 0.5f * (-q1 * gx - q2 * gy - q3 * gz);
   qDot2 = 0.5f * (q0 * gx + q2 * gz - q3 * gy);
@@ -525,17 +430,17 @@ void AHRSupdate(float *dt) {
     s3 *= recipNorm;
 
     // Apply feedback step
-    qDot1 -= beta2 * s0;
-    qDot2 -= beta2 * s1;
-    qDot3 -= beta2 * s2;
-    qDot4 -= beta2 * s3;
+    qDot1 -= beta * s0;
+    qDot2 -= beta * s1;
+    qDot3 -= beta * s2;
+    qDot4 -= beta * s3;
   }
 
   // Integrate rate of change of quaternion to yield quaternion
-  q0 += qDot1 * *dt;
-  q1 += qDot2 * *dt;
-  q2 += qDot3 * *dt;
-  q3 += qDot4 * *dt;
+  q0 += qDot1 * dt;
+  q1 += qDot2 * dt;
+  q2 += qDot3 * dt;
+  q3 += qDot4 * dt;
 
   // Normalise quaternion
   recipNorm = invSqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
@@ -591,6 +496,7 @@ float invSqrt(float number) {
   y = y * ( f - ( x * y * y ) );
   return y;
 }
+
 
 
 
